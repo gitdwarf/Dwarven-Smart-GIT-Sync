@@ -1,4 +1,70 @@
 #!/usr/bin/env bash
+
+## User variables ##
+## (ignored if config file is auto-detected or cfg_path is set)
+
+# Path to external XML config (overrides all internal vars below)
+#
+# Auto-detect: if this is empty, the script automatically checks
+#   ~/.config/smart-git-sync/config.cfg on every startup.
+#   If that file exists, it is loaded as if cfg_path pointed to it.
+#   This means the first-run wizard's saved config is always picked up
+#   without any manual configuration here.
+#
+# Set this var to OVERRIDE the default config location:
+#   - Absolute path: used as-is
+#     Example: "/etc/smart-git-sync/config.cfg"
+#   - Relative path (no leading /): relative to $HOME
+#     Example: ".config/sgs/config.cfg"
+#   - Explicit $PWD relative: use ./
+#     Example: "./configs/config.cfg"
+#   - Empty = auto-detect default, then fall back to internal vars below
+
+# Root directory containing repos or account directories
+github_root="$HOME/GitHub"
+
+# List of accounts (comma or space separated)
+# If length == 1  → single-account mode
+# If length > 1   → multi-account mode
+accounts=""
+
+# Safety controls
+allow_dirty=true        # If true, skip dirty repo prompts
+fast_forward_only=true   # Enforce --ff-only pulls
+auto_stash=false         # If true, stash dirty changes, pull, pop (implies allow_dirty)
+
+# Logging controls
+#
+# Hierarchy:
+#   enable_logging=true  → ALWAYS logs to stdout
+#                        → PLUS file (if log_dir set)
+#                        → PLUS email (if email_logs=true AND log_email_address set)
+#
+#   enable_logging=false → silent (no output at all)
+#
+# log_dir path handling (same as cfg_path above):
+#   - Absolute: /var/log/git-sync → /var/log/git-sync/smart-git-sync_TIMESTAMP.log
+#   - Relative: .local/state → $HOME/.local/state/smart-git-sync_TIMESTAMP.log
+#   - Explicit $PWD: ./logs → $PWD/logs/smart-git-sync_TIMESTAMP.log
+#   - Empty = no file logging (stdout + email only)
+#
+# email_logs:
+#   - Requires log_email_address to be set
+#   - If log_email_address empty, email disabled regardless of this setting
+#   - Requires MTA (mail transport agent) on system
+enable_logging=true
+log_dir="$HOME/.local/state/smart-git-sync"
+email_logs=false
+log_email_address=""
+
+# Password storage (encrypted with hardware fingerprint)
+#
+# If empty or unset → ALWAYS prompt for credentials, never offer to store
+# If set            → stores encrypted token at this path
+password_store="$HOME/.config/smart-git-sync/.ghtoken"
+
+### User Variables END ###
+
 #
 # Dwarven-Smart-GIT-Sync
 # Part of the DwarvenSuite -- https://github.com/gitdwarf
@@ -15,11 +81,132 @@
 # GNU General Public License for more details.
 #
 # smart-git-sync.sh
-Version="0.2.5"
-Released="2026-05-25"
+Version="0.4.8"
+Released="2026-07-08"
 #
 # Changelog:
-#   0.2.5 - Credential verification reworked to honour the brief
+#   0.4.8 - 403 no longer triggers credential rotation (was the cause of repeated prompts)
+#           403 = GitHub permission denied (right creds, wrong access level)
+#           401 = bad credentials (triggers rotation)
+#           403 now logs clear actionable message: check PAT scope / repo permissions
+#           Push 403 specifically mentions Contents:write for fine-grained PATs
+#
+#   0.4.7 - fn_build_auth_url helper; token-in-origin cleaned on sync - fn_build_auth_url helper: strips any existing auth prefix correctly
+#           fn_sync_repo: detects token-in-origin, cleans it on first encounter
+#           All clone operations (clone-missing, create-repo, prompt-clone):
+#             immediately set origin to clean https://github.com/ after clone
+#           Token is injected per-operation only, never persisted in origin URL
+#
+#   0.4.6 - oauth2:TOKEN URL format; GIT_TERMINAL_PROMPT=0 everywhere - Fixed PAT URL format: https://oauth2:TOKEN@github.com/
+#           Previous format (TOKEN@github.com) treated token as username,
+#           git still prompted for password. oauth2: prefix is correct.
+#           Applied to all 6 URL construction sites (fetch, push, clone x3)
+#
+#   0.4.5 - fn_git_net: GIT_TERMINAL_PROMPT=0 on all network git operations - fn_git_net: centralised authenticated git network helper
+#           Sets GIT_TERMINAL_PROMPT=0 on all network git operations (fetch/push/merge/clone)
+#           Eliminates credential helper interception and password prompts entirely
+#           Fixed fn_sync_repo function header lost during refactor
+#
+#   0.4.4 - User variables moved to top of file - User variables block moved to top of file (after shebang)
+#           First thing a user sees when opening the script is what to configure
+#
+#   0.4.3 - fn_detect_mode no longer prompts in first-run; auth URL always used - fn_detect_mode: removed credential prompting from first-run path
+#           First-run wizard is the single point of credential setup (no more double prompt)
+#           fn_sync_repo fetch/push: always use auth URL directly (no unauthenticated fallback)
+#           Auth failure now retries immediately after credential rotation (no re-run needed)
+#           Removed duplicate "Updated credentials saved to" log
+#
+#   0.4.2 - git identity check in fn_commit_repo and first-run wizard - Dirty skip message simplified: only --commit is relevant for uncommitted changes
+#           fn_commit_repo: checks git identity before committing; prompts and sets
+#             globally if not configured; non-interactive logs fix commands
+#           First-run wizard: checks and prompts for git identity if not set
+#
+#   0.4.1 - Dirty skip message updated to mention --commit - Dirty skip message updated to mention --commit as an option
+#
+#   0.4.0 - --commit / --message flags, fn_commit_repo - --commit: stage and commit dirty changes before syncing
+#           --message / -m: supply commit message (implies --commit)
+#           fn_commit_repo: prompts for message interactively with auto-suggestion
+#             from changed filenames; non-interactive auto-generates; dry-run aware
+#           Nothing-to-commit is a no-op, not an error
+#
+#   0.3.9 - Clone prompt default Y; --repo clone-if-missing - Clone prompt default changed from [y/N] to [Y/n]
+#           User named the repo explicitly -- intent is unambiguous
+#
+#   0.3.8 - --repo: prompt to clone if not found locally - --repo <name>: if not found locally, prompt to clone rather than error
+#           fn_prompt_clone_missing_repo: interactive y/N, dry-run aware,
+#             non-interactive safe (logs skip, no hang), PAT required for clone
+#
+#   0.3.7 - --repo <name>: sync single repo - --repo <name>: sync a single named repo instead of all
+#           Works in single-account and multi-account modes
+#           Missing repo name logs error and returns cleanly
+#           Chainable: --repo DwarvenModeller --dry-run
+#
+#   0.3.6 - Removed duplicate save log; bad token auto-prompts for update - Removed duplicate "Saved to" log in fn_update_account
+#           fn_verify_account_credentials: bad token format now triggers
+#             fn_rotate_account_credentials immediately (interactive)
+#             rather than just warning and continuing with a corrupt token
+#
+#   0.3.5 - fn_test_ssh_key, fn_test_pat, fn_detect_credential_type redirect
+#           all output to stderr (critical: were polluting $() captures) - Root cause fixed: fn_test_ssh_key, fn_test_pat, fn_detect_credential_type
+#           all redirect fn_log_msg and echo to stderr (>&2) -- these functions
+#           are called inside $() command substitution; stdout was being captured
+#           into account_auth_method and account_token arrays, corrupting them
+#           Removed debug logging from fn_list_repos_for_account
+#
+#   0.3.4 - fn_list_repos_for_account extracted to top-level, CR strip loop - fn_list_repos_for_account extracted to top-level function
+#           Nested function was NOT seeing updated globals after --update-account
+#           (bash nested functions are defined at call time, globals not refreshed)
+#           fn_prompt_value: strip ALL trailing CRs not just one (while loop)
+#
+#   0.3.3 - Chainable flags, --update-account --list-repos works in sequence - Chainable flags: account management and --clone-missing no longer exit
+#           Execution order: reset -> create-repo -> add/update/remove-account
+#             -> clone-missing -> status -> list-repos -> sync
+#           --update-account --list-repos now works as expected
+#           --clone-missing --list-repos clones then shows updated overview
+#           Usage updated with chainable flag examples
+#
+#   0.3.2 - PAT warning points to --update-account; API failure explicit in list-repos - PAT warning message corrected to --update-account (not --add-account)
+#           fn_list_repos: API failure now logged explicitly with fix command
+#             rather than silently returning empty remote list
+#
+#   0.3.1 - --update-account flag, fn_update_account - --update-account: re-prompt credentials for existing account in place
+#           No remove/re-add needed; account ordering preserved
+#           SSH-only note in --list-repos now points to --update-account
+#           manage_account_action now supports: add | remove | update
+#
+#   0.3.0 - fn_list_repos: full two-way overview with GitHub API cross-reference - fn_list_repos rewritten as full two-way overview
+#           Queries GitHub API per account (PAT) and cross-references with local
+#           Shows: local+GitHub (synced), local-only, GitHub-only (not cloned)
+#           SSH-only accounts: local listing with explicit note and fix command
+#           Per-account summary: local count, GitHub total, not-cloned count
+#
+#   0.2.9 - CR strip in credential file load, --list-repos zero-count message - fn_load_all_credentials: strip trailing CR from account and blob
+#             (credentials file may carry \r from prior bad save)
+#           --list-repos: when total=0, explains it shows local repos only
+#             and suggests --clone-missing
+#
+#   0.2.8 - Fixed credential load: IFS split and cut -f2- fixes - Fixed credential load corruption: IFS=': ' was splitting blobs on
+#           any colon, space, or equals -- base64 blobs contain all of these
+#           fn_load_all_credentials: now splits on first ': ' only (%%: * / #*: )
+#           fn_parse_account_credentials: cut -f2- preserves = in token values
+#           Removed duplicate fn_save_credentials call in wizard
+#
+#   0.2.7 - cfg_path comment documents auto-detect behaviour - cfg_path comment updated: documents auto-detect behaviour clearly
+#           cfg_path is now an override, not a requirement
+#           Root cause of "config not saved" identified: CR on PAT caused
+#           fn_test_pat to fail, fn_setup_account_credentials returned 1,
+#           wizard hit exit 1 before fn_write_external_config was reached
+#           CR fix in 0.2.6 resolves this -- 0.2.7 adds documentation clarity
+#
+#   0.2.6 - fn_normalize_path: $VAR expansion, no spurious filename append, CR strip - fn_normalize_path: expand $VAR and ~ in user-typed input (eval)
+#           fn_normalize_path: no longer appends filename when path already ends with it
+#           fn_normalize_path: filename param now optional
+#           First-run wizard: uses pre-set github_root as default (not hardcoded ~/GitHub)
+#           First-run wizard: no exit 0 after setup -- falls through to sync immediately
+#           Entry point: auto-detects ~/.config/smart-git-sync/config.cfg if cfg_path unset
+#           fn_prompt_value: strips trailing CR from all input (copy-paste fix)
+#
+#   0.2.5 - Credential verification reworked to honour the brief - Credential verification reworked to honour the brief
 #           fn_verify_account_credentials: local sanity check only (no network)
 #             checks key file exists on disk, token looks like a GitHub PAT
 #             trust stored credentials until proven wrong by actual sync failure
@@ -128,71 +315,6 @@ set -euo pipefail
 
 cfg_path=""
 
-# Path to external XML config (if set, overrides all internal vars below)
-#
-# Path handling:
-#   - Absolute path (starts with /): used as-is
-#     Example: "/etc/smart-git-sync" → /etc/smart-git-sync/smart-git-sync.cfg
-#
-#   - Relative path (no leading /): relative to $HOME
-#     Example: ".config" → $HOME/.config/smart-git-sync.cfg
-#
-#   - Explicit $PWD relative: use ./
-#     Example: "./configs" → $PWD/configs/smart-git-sync.cfg
-#
-#   - With or without trailing /: both work
-#     Example: ".config" and ".config/" → same result
-#
-#   - Filename is always: smart-git-sync.cfg
-#
-#   - Empty = use internal vars below (no external config)
-
-## User variables (ignored if cfg_path is set) ##
-
-# Root directory containing repos or account directories
-github_root="$HOME/GitHub"
-
-# List of accounts (comma or space separated)
-# If length == 1  → single-account mode
-# If length > 1   → multi-account mode
-accounts=""
-
-# Safety controls
-allow_dirty=false        # If true, skip dirty repo prompts
-fast_forward_only=true   # Enforce --ff-only pulls
-auto_stash=false         # If true, stash dirty changes, pull, pop (implies allow_dirty)
-
-# Logging controls
-#
-# Hierarchy:
-#   enable_logging=true  → ALWAYS logs to stdout
-#                        → PLUS file (if log_dir set)
-#                        → PLUS email (if email_logs=true AND log_email_address set)
-#
-#   enable_logging=false → silent (no output at all)
-#
-# log_dir path handling (same as cfg_path above):
-#   - Absolute: /var/log/git-sync → /var/log/git-sync/smart-git-sync_TIMESTAMP.log
-#   - Relative: .local/state → $HOME/.local/state/smart-git-sync_TIMESTAMP.log
-#   - Explicit $PWD: ./logs → $PWD/logs/smart-git-sync_TIMESTAMP.log
-#   - Empty = no file logging (stdout + email only)
-#
-# email_logs:
-#   - Requires log_email_address to be set
-#   - If log_email_address empty, email disabled regardless of this setting
-#   - Requires MTA (mail transport agent) on system
-enable_logging=true
-log_dir="$HOME/.local/state/smart-git-sync"
-email_logs=false
-log_email_address=""
-
-# Password storage (encrypted with hardware fingerprint)
-#
-# If empty or unset → ALWAYS prompt for credentials, never offer to store
-# If set            → stores encrypted token at this path
-password_store="$HOME/.config/smart-git-sync/.ghtoken"
-
-### User Variables END ###
 
 
 ### Script starts here ###
@@ -210,6 +332,9 @@ show_status=false
 list_repos=false
 reset_config=false
 clone_missing=false
+repo_filter=""        # if set, only sync this repo name
+do_commit=false       # if true, stage and commit dirty changes before sync
+commit_message=""     # if set, use as commit message; if empty, auto-generate
 
 # --create-repo state
 create_repo_name=""
@@ -218,7 +343,7 @@ create_repo_description=""
 create_repo_visibility=""  # public | private (set by prompt)
 
 # --add-account / --remove-account state
-manage_account_action=""   # add | remove
+manage_account_action=""   # add | remove | update
 manage_account_name=""     # optional: name pre-supplied via --account
 
 # Associative arrays for multi-account credential storage
@@ -273,6 +398,11 @@ fn_prompt_value() {
     read -rp "$prompt: " value
   fi
 
+  # Strip all trailing CR chars (copy-paste can add one or more \r)
+  while [[ "$value" == *$'\r' ]]; do
+    value="${value%$'\r'}"
+  done
+
   echo "$value"
 }
 
@@ -281,13 +411,16 @@ fn_prompt_value() {
 # $2 = filename to append (e.g. "smart-git-sync.cfg")
 fn_normalize_path() {
   local path="$1"
-  local filename="$2"
+  local filename="${2:-}"
 
   # Empty = return empty
   if [[ -z "$path" ]]; then
     echo ""
     return
   fi
+
+  # Expand environment variables typed literally by the user (e.g. $HOME, $USER)
+  path=$(eval echo "\"$path\"" 2>/dev/null || echo "$path")
 
   # Expand tilde (~)
   path="${path/#\~/$HOME}"
@@ -302,11 +435,15 @@ fn_normalize_path() {
     path="$PWD/${path#./}"
   fi
 
-  # Remove trailing slash if present
+  # Remove trailing slash
   path="${path%/}"
 
-  # Append filename
-  echo "$path/$filename"
+  # Only append filename if one was supplied AND the path doesn't already end with it
+  if [[ -n "$filename" && "${path##*/}" != "$filename" ]]; then
+    echo "$path/$filename"
+  else
+    echo "$path"
+  fi
 }
 
 ### Password storage (hardware fingerprint encryption, multi-account) ###
@@ -381,15 +518,15 @@ fn_parse_account_credentials() {
   local decrypted="$1"
 
   local auth_method
-  auth_method=$(echo "$decrypted" | grep '^auth_method=' | cut -d= -f2)
+  auth_method=$(echo "$decrypted" | grep '^auth_method=' | cut -d= -f2-)
 
   if [[ "$auth_method" == "ssh" ]]; then
     local ssh_key
-    ssh_key=$(echo "$decrypted" | grep '^ssh_key=' | cut -d= -f2)
+    ssh_key=$(echo "$decrypted" | grep '^ssh_key=' | cut -d= -f2-)
     echo "ssh|$ssh_key"
   else
     local token
-    token=$(echo "$decrypted" | grep '^token=' | cut -d= -f2)
+    token=$(echo "$decrypted" | grep '^token=' | cut -d= -f2-)
     echo "token|$token"
   fi
 }
@@ -407,9 +544,18 @@ fn_load_all_credentials() {
   fi
 
   # Read file, skip comments and empty lines
-  while IFS=': ' read -r account blob; do
-    # Skip comments, empty lines, and malformed lines
-    [[ -z "$account" || "$account" =~ ^# || -z "$blob" ]] && continue
+  while IFS= read -r line; do
+    # Skip comments and empty lines
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+    # Split on first ': ' only -- blob may contain ':', spaces, '=' etc
+    local account="${line%%: *}"
+    local blob="${line#*: }"
+    # Strip trailing CR (file may have been written with \r\n on some systems)
+    blob="${blob%$'\r'}"
+    account="${account%$'\r'}"
+
+    [[ -z "$account" || -z "$blob" || "$account" == "$line" ]] && continue
 
     # Decrypt this account's blob
     local decrypted
@@ -468,8 +614,13 @@ fn_verify_account_credentials() {
     fi
     # Basic plausibility: GitHub PATs start with ghp_, github_pat_, or gho_
     if [[ ! "$token" =~ ^gh[pos]_|^github_pat_ ]]; then
-      fn_log_msg "WARNING: Token for '$account' does not look like a GitHub PAT"
-      fn_log_msg "         If sync fails with auth errors, run: smart-git-sync.sh --add-account"
+      fn_log_msg "WARNING: Stored token for '$account' does not look like a valid GitHub PAT"
+      if [[ -t 0 ]]; then
+        fn_log_msg "Prompting to update credentials now..."
+        fn_rotate_account_credentials "$account"
+      else
+        fn_log_msg "         Run interactively to fix: smart-git-sync.sh --update-account --account $account"
+      fi
     fi
   else
     fn_log_msg "WARNING: Unknown auth method '$auth_method' for '$account'"
@@ -508,7 +659,6 @@ fn_rotate_account_credentials() {
     fn_log_msg "New credentials accepted for '$account'"
     if [[ -n "$password_store" ]]; then
       fn_save_credentials
-      fn_log_msg "Updated credentials saved to: $password_store"
     fi
     return 0
   else
@@ -563,52 +713,43 @@ EOF
 # $1 = SSH key path
 # $2 = expected account name
 # Returns: 0 if authenticated as expected account, 1 otherwise
+# NOTE: all diagnostic output goes to stderr -- this function is called via $()
 fn_test_ssh_key() {
   local key_path="$1"
   local account="$2"
 
-  # Verify key file exists and is readable
   if [[ ! -f "$key_path" ]]; then
-    fn_log_msg "SSH key not found: $key_path"
+    fn_log_msg "SSH key not found: $key_path" >&2
     return 1
   fi
 
-  # Passphrase detection: try to read the public key with an empty passphrase
-  # If it fails, the key is passphrase-protected -- will hang unattended
   if ! ssh-keygen -y -P "" -f "$key_path" &>/dev/null; then
-    fn_log_msg "WARNING: SSH key has a passphrase: $key_path"
-    fn_log_msg "         This will block unattended use. Consider using ssh-agent,"
-    fn_log_msg "         or a passphrase-free key dedicated to automation."
-    echo ""
-    echo "WARNING: SSH key '$key_path' is passphrase-protected."
-    echo "         Unattended sync will hang waiting for the passphrase."
-    echo "         Options:"
-    echo "           1. Run ssh-agent and ssh-add before running this script"
-    echo "           2. Use a separate passphrase-free key for automation"
-    echo "           3. Use a PAT instead (--add-account, choose token auth)"
-    echo ""
-    # Don't fail -- user may have ssh-agent running; warn and continue
+    fn_log_msg "WARNING: SSH key has a passphrase: $key_path" >&2
+    fn_log_msg "         This will block unattended use." >&2
+    echo "" >&2
+    echo "WARNING: SSH key '$key_path' is passphrase-protected." >&2
+    echo "         Options:" >&2
+    echo "           1. Run ssh-agent and ssh-add before running this script" >&2
+    echo "           2. Use a passphrase-free key dedicated to automation" >&2
+    echo "           3. Use a PAT instead (--update-account)" >&2
+    echo "" >&2
   fi
 
-  # Test this specific key against GitHub
   local result
   result=$(ssh -T -i "$key_path" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null git@github.com 2>&1)
 
-  # Check for success message
   if echo "$result" | grep -q "successfully authenticated"; then
-    # Extract username from response
     local ssh_user
     ssh_user=$(echo "$result" | grep -o "Hi [^!]*" | cut -d' ' -f2)
-
     if [[ "$ssh_user" == "$account" ]]; then
-      fn_log_msg "SSH key authenticated as $ssh_user ✓"
+      fn_log_msg "SSH key authenticated as $ssh_user ✓" >&2
       return 0
     else
-      fn_log_msg "SSH key authenticated as '$ssh_user' but expected '$account'"
+      fn_log_msg "SSH key authenticated as '$ssh_user' but expected '$account'" >&2
       return 1
     fi
   else
-    fn_log_msg "SSH authentication failed for key: $key_path"
+    fn_log_msg "SSH authentication failed for key: $key_path" >&2
     return 1
   fi
 }
@@ -617,41 +758,36 @@ fn_test_ssh_key() {
 # $1 = token string
 # $2 = expected account name
 # Returns: 0 if authenticated as expected account, 1 otherwise
+# NOTE: all diagnostic output goes to stderr -- this function is called via $()
 fn_test_pat() {
   local token="$1"
   local account="$2"
-
   local api_result
 
-  # Try curl first, then wget, then give up
   if command -v curl >/dev/null 2>&1; then
     api_result=$(curl -s -H "Authorization: token $token" https://api.github.com/user 2>/dev/null)
   elif command -v wget >/dev/null 2>&1; then
     api_result=$(wget -q --header="Authorization: token $token" -O- https://api.github.com/user 2>/dev/null)
   else
-    # No curl/wget - can't validate, trust user input
-    fn_log_msg "WARNING: curl/wget not found - cannot validate PAT (will test during git operations)"
-    return 0  # Assume valid, will fail later if wrong
+    fn_log_msg "WARNING: curl/wget not found - cannot validate PAT" >&2
+    return 0
   fi
 
-  # Check if we got a valid response with login field
   if echo "$api_result" | grep -q '"login"'; then
     local api_user
     api_user=$(echo "$api_result" | grep '"login"' | head -1 | sed 's/.*"login": *"\([^"]*\)".*/\1/')
-
     if [[ "$api_user" == "$account" ]]; then
-      fn_log_msg "PAT authenticated as $api_user ✓"
+      fn_log_msg "PAT authenticated as $api_user ✓" >&2
       return 0
     else
-      fn_log_msg "PAT authenticated as '$api_user' but expected '$account'"
+      fn_log_msg "PAT authenticated as '$api_user' but expected '$account'" >&2
       return 1
     fi
   else
-    # Check for error messages
     if echo "$api_result" | grep -q "Bad credentials"; then
-      fn_log_msg "PAT authentication failed: Bad credentials"
+      fn_log_msg "PAT authentication failed: Bad credentials" >&2
     else
-      fn_log_msg "PAT authentication failed: Invalid or expired token"
+      fn_log_msg "PAT authentication failed: Invalid or expired token" >&2
     fi
     return 1
   fi
@@ -661,13 +797,14 @@ fn_test_pat() {
 # $1 = user input (path to SSH key OR token string)
 # $2 = account name
 # Returns: "ssh|/path/to/key" or "token|ghp_xxx" on success, empty on failure
+# NOTE: all diagnostic output goes to stderr -- this function is called via $()
 fn_detect_credential_type() {
   local input="$1"
   local account="$2"
 
   # Strategy 1: Does it look like a file path and exist?
   if [[ -f "$input" ]]; then
-    fn_log_msg "Detected file path, testing as SSH key..."
+    fn_log_msg "Detected file path, testing as SSH key..." >&2
     if fn_test_ssh_key "$input" "$account"; then
       echo "ssh|$input"
       return 0
@@ -677,10 +814,8 @@ fn_detect_credential_type() {
   fi
 
   # Strategy 2: Does it match GitHub PAT format?
-  # Classic: ghp_xxxxx (40 chars after prefix)
-  # Fine-grained: github_pat_xxxxx
   if [[ "$input" =~ ^(ghp_|github_pat_) ]]; then
-    fn_log_msg "Detected GitHub PAT format, testing..."
+    fn_log_msg "Detected GitHub PAT format, testing..." >&2
     if fn_test_pat "$input" "$account"; then
       echo "token|$input"
       return 0
@@ -689,19 +824,13 @@ fn_detect_credential_type() {
     fi
   fi
 
-  # Strategy 3: Not a file, doesn't match PAT format
-  # Could be:
-  #   - Old PAT format
-  #   - User pasted without ghp_ prefix
-  #   - Just random string
-  # Try as PAT anyway
-  fn_log_msg "Unknown format, attempting as PAT..."
+  # Strategy 3: Unknown format -- try as PAT anyway
+  fn_log_msg "Unknown format, attempting as PAT..." >&2
   if fn_test_pat "$input" "$account"; then
     echo "token|$input"
     return 0
   fi
 
-  # Nothing worked
   return 1
 }
 
@@ -1049,34 +1178,27 @@ fn_detect_mode() {
   # Load existing credentials from file
   fn_load_all_credentials
 
-  # Empty accounts = first-run, prompt for first account
+  # Empty accounts = first-run
   if [[ ${#account_array[@]} -eq 0 ]]; then
     mode="first-run"
     fn_log_msg "No accounts configured - first run setup"
-
-    # If password_store is configured and no file yet, prompt for first account
-    if [[ -n "$password_store" && ! -f "$password_store" ]]; then
-      fn_setup_account_credentials
-    fi
-
     return 0
   fi
 
-  # Accounts configured - check credentials for each one
+  # Accounts configured - verify credentials for each one
   for account in "${account_array[@]}"; do
     if [[ -z "${account_auth_method[$account]:-}" ]]; then
-      # No stored credentials for this account
       fn_log_msg "No stored credentials for account: $account"
 
       if [[ ! -t 0 ]]; then
         fn_log_msg "ERROR: No credentials for '$account' and stdin is not a terminal"
-        fn_log_msg "       Run interactively to set up: smart-git-sync.sh --add-account"
+        fn_log_msg "       Run interactively: smart-git-sync.sh --update-account --account $account"
         continue
       fi
 
       if fn_prompt_and_validate_credential "$account"; then
         account="$CREDENTIAL_ACCOUNT"
-        if [[ -n "$password_store" ]] && ! [[ -f "$password_store" && ! -s "$password_store" ]]; then
+        if [[ -n "$password_store" ]]; then
           local save_choice
           read -rp "Store logon credentials for $account? [Y/n]: " save_choice
           case "$save_choice" in
@@ -1088,7 +1210,6 @@ fn_detect_mode() {
         fn_log_msg "Credential setup for $account cancelled - skipping"
       fi
     else
-      # Credentials loaded -- verify they still work, re-prompt if not
       fn_verify_account_credentials "$account"
     fi
   done
@@ -1118,13 +1239,13 @@ fn_first_run_setup() {
   echo ""
 
   # --- github_root ---
-  local default_root="$HOME/GitHub"
+  local default_root="${github_root:-$HOME/GitHub}"
   local input_root
   read -rp "GitHub repos root directory [$default_root]: " input_root
   if [[ -z "$input_root" ]]; then
-    github_root="$default_root"
+    github_root=$(fn_normalize_path "$default_root" "")
   else
-    github_root=$(fn_normalize_path "$input_root" "GitHub")
+    github_root=$(fn_normalize_path "$input_root" "")
   fi
   echo "  -> github_root: $github_root"
   mkdir -p "$github_root"
@@ -1171,6 +1292,26 @@ fn_first_run_setup() {
     echo ""
   fi
 
+  # --- Git identity ---
+  local git_user git_email
+  git_user=$(git config --global user.name 2>/dev/null)
+  git_email=$(git config --global user.email 2>/dev/null)
+
+  if [[ -z "$git_user" || -z "$git_email" ]]; then
+    echo "Git needs to know who you are to make commits."
+    echo ""
+    if [[ -z "$git_user" ]]; then
+      read -rp "Your name (for git commits): " git_user
+      git config --global user.name "$git_user"
+    fi
+    if [[ -z "$git_email" ]]; then
+      read -rp "Your email (for git commits): " git_email
+      git config --global user.email "$git_email"
+    fi
+    echo "  -> git identity: $git_user <$git_email>"
+    echo ""
+  fi
+
   # --- First account ---
   echo "Now let's add your first GitHub account."
   echo ""
@@ -1182,10 +1323,7 @@ fn_first_run_setup() {
   local first_account="$CREDENTIAL_ACCOUNT"
   accounts="$first_account"
 
-  # Save credentials if store is configured
-  if [[ -n "$password_store" ]]; then
-    fn_save_credentials
-  fi
+  # Note: fn_setup_account_credentials already prompted to save credentials
 
   # --- Additional accounts ---
   echo ""
@@ -1253,6 +1391,118 @@ fn_first_run_setup() {
 # $1 = account name (used for credential lookup; empty = single-account mode)
 # $2 = full path to repo directory
 # Increments global counters directly
+# Stage and commit all changes in a repo
+# $1 = repo path
+# Uses global commit_message; prompts if empty; auto-generates if user hits Enter
+fn_commit_repo() {
+  local repo_path="$1"
+  local repo_name
+  repo_name="$(basename "$repo_path")"
+
+  # Check there's actually something to commit
+  local git_status
+  git_status=$(git -C "$repo_path" status --porcelain 2>&1)
+  if [[ -z "$git_status" ]]; then
+    fn_log_msg "  SKIP commit $repo_name: nothing to commit"
+    return 0
+  fi
+
+  if [[ "$dry_run" == "true" ]]; then
+    fn_log_msg "  DRY  $repo_name: would commit $(echo "$git_status" | wc -l | tr -d ' ') changed file(s)"
+    return 0
+  fi
+
+  # Check git identity is configured -- commit will fail without it
+  local git_user git_email
+  git_user=$(git config --global user.name 2>/dev/null)
+  git_email=$(git config --global user.email 2>/dev/null)
+
+  if [[ -z "$git_user" || -z "$git_email" ]]; then
+    fn_log_msg "  Git identity not configured -- needed for commits"
+    if [[ ! -t 0 ]]; then
+      fn_log_msg "  ERROR: stdin is not a terminal -- cannot prompt for git identity"
+      fn_log_msg "         Run: git config --global user.name 'Your Name'"
+      fn_log_msg "         Run: git config --global user.email 'you@example.com'"
+      return 1
+    fi
+    echo ""
+    echo "Git needs to know who you are to make commits."
+    if [[ -z "$git_user" ]]; then
+      read -rp "Your name (for git commits): " git_user
+      git config --global user.name "$git_user"
+    fi
+    if [[ -z "$git_email" ]]; then
+      read -rp "Your email (for git commits): " git_email
+      git config --global user.email "$git_email"
+    fi
+    fn_log_msg "  Git identity set: $git_user <$git_email>"
+  fi
+
+  # Determine commit message
+  local msg="$commit_message"
+  if [[ -z "$msg" ]]; then
+    if [[ -t 0 ]]; then
+      # Build auto-suggestion from changed filenames
+      local changed_files
+      changed_files=$(git -C "$repo_path" diff --name-only HEAD 2>/dev/null)
+      [[ -z "$changed_files" ]] && changed_files=$(git -C "$repo_path" status --porcelain | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
+      local auto_msg="sync: $changed_files"
+      echo ""
+      read -rp "Describe what changed ($repo_name) [Enter for: $auto_msg]: " msg
+      [[ -z "$msg" ]] && msg="$auto_msg"
+    else
+      # Non-interactive: auto-generate
+      local changed_files
+      changed_files=$(git -C "$repo_path" status --porcelain | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
+      msg="sync: $changed_files"
+      fn_log_msg "  AUTO commit message: $msg"
+    fi
+  fi
+
+  # Stage all and commit
+  git -C "$repo_path" add -A 2>&1
+  local commit_out commit_exit=0
+  commit_out=$(git -C "$repo_path" commit -m "$msg" 2>&1) || commit_exit=$?
+  if [[ $commit_exit -ne 0 ]]; then
+    fn_log_msg "  FAIL $repo_name: commit failed: $commit_out"
+    return 1
+  fi
+  fn_log_msg "  OK   $repo_name: committed -- $msg"
+  return 0
+}
+
+# Run a git network operation with authentication and no interactive prompts
+# $1 = repo path (for -C), or "" for no -C
+# $2... = git arguments
+# Uses global remote_url and git_env; sets GIT_TERMINAL_PROMPT=0 to suppress prompts
+# Build an authenticated HTTPS URL from a remote URL and PAT
+# Strips any existing auth prefix, injects oauth2:TOKEN
+# $1 = base URL (from git remote get-url origin)
+# $2 = PAT token
+fn_build_auth_url() {
+  local url="$1"
+  local token="$2"
+  local host_path
+  if [[ "$url" == *"@"* ]]; then
+    host_path="${url#*@}"      # strip everything up to and including @
+  else
+    host_path="${url#https://}" # strip scheme only
+  fi
+  echo "https://oauth2:${token}@${host_path}"
+}
+
+fn_git_net() {
+  local repo_path="$1"; shift
+  local base_cmd=()
+  [[ -n "$repo_path" ]] && base_cmd+=( git -C "$repo_path" ) || base_cmd+=( git )
+
+  if [[ ${#git_env[@]} -gt 0 ]]; then
+    GIT_TERMINAL_PROMPT=0 env "${git_env[@]}" "${base_cmd[@]}" "$@"
+  else
+    GIT_TERMINAL_PROMPT=0 "${base_cmd[@]}" "$@"
+  fi
+}
+
 fn_sync_repo() {
   local account="$1"
   local repo_path="$2"
@@ -1290,6 +1540,15 @@ fn_sync_repo() {
     fn_log_msg "  WARN $repo_name: on non-default branch '$current_branch' (tracking: $tracking)"
   fi
 
+  # --- Commit dirty changes if --commit flag set ---
+  if [[ "$do_commit" == "true" ]]; then
+    fn_commit_repo "$repo_path" || {
+      fn_log_msg "  SKIP $repo_name: commit failed, skipping sync"
+      (( repos_skipped++ )) || true
+      return 0
+    }
+  fi
+
   # --- Dirty check ---
   local git_status
   git_status=$(git -C "$repo_path" status --porcelain 2>&1)
@@ -1307,7 +1566,7 @@ fn_sync_repo() {
     elif [[ "$allow_dirty" == "true" ]]; then
       fn_log_msg "  WARN $repo_name: dirty (proceeding - allow_dirty=true)"
     else
-      fn_log_msg "  SKIP $repo_name: dirty working tree (set allow_dirty=true or auto_stash=true to override)"
+      fn_log_msg "  SKIP $repo_name: dirty working tree (use --commit to stage and commit first)"
       (( repos_skipped++ )) || true
       return 0
     fi
@@ -1315,6 +1574,7 @@ fn_sync_repo() {
 
   # --- Build remote URL with embedded auth (for token accounts) ---
   # SSH accounts use GIT_SSH_COMMAND; token accounts embed PAT in URL
+  # NOTE: origin is kept as clean https://github.com/ URL -- token injected per-operation only
   local git_env=()
   local remote_url=""
   if [[ -n "$account" ]]; then
@@ -1325,12 +1585,16 @@ fn_sync_repo() {
     elif [[ "$auth_method" == "token" ]]; then
       local token="${account_token[$account]:-}"
       if [[ -n "$token" ]]; then
-        # Get the current remote URL and inject the PAT
         local base_url
         base_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null)
-        if [[ "$base_url" =~ ^https://github.com/(.+) ]]; then
-          remote_url="https://${token}@github.com/${BASH_REMATCH[1]}"
+        # If origin has a token embedded, clean it up -- token-in-origin causes stale auth issues
+        if [[ "$base_url" == *"@"* ]]; then
+          local clean_url="https://${base_url#*@}"
+          git -C "$repo_path" remote set-url origin "$clean_url" 2>/dev/null
+          fn_log_msg "  INFO $repo_name: cleaned embedded token from origin URL"
+          base_url="$clean_url"
         fi
+        remote_url=$(fn_build_auth_url "$base_url" "$token")
       fi
     fi
   fi
@@ -1338,26 +1602,46 @@ fn_sync_repo() {
   # --- Fetch (no merge) -- establishes ground truth before deciding direction ---
   local fetch_output fetch_exit=0
   if [[ -n "$remote_url" ]]; then
-    fetch_output=$(git -C "$repo_path" fetch origin --quiet 2>&1) || fetch_exit=$?
-    # Re-run with auth URL if plain fetch fails
-    if [[ $fetch_exit -ne 0 ]]; then
-      fetch_output=$(git -C "$repo_path" fetch "$remote_url" --quiet 2>&1) || fetch_exit=$?
-    fi
+    fetch_output=$(fn_git_net "$repo_path" fetch "$remote_url" --quiet 2>&1) || fetch_exit=$?
   elif [[ ${#git_env[@]} -gt 0 ]]; then
-    fetch_output=$(env "${git_env[@]}" git -C "$repo_path" fetch origin --quiet 2>&1) || fetch_exit=$?
+    fetch_output=$(fn_git_net "$repo_path" fetch origin --quiet 2>&1) || fetch_exit=$?
   else
-    fetch_output=$(git -C "$repo_path" fetch origin --quiet 2>&1) || fetch_exit=$?
+    fetch_output=$(fn_git_net "$repo_path" fetch origin --quiet 2>&1) || fetch_exit=$?
   fi
 
   if [[ $fetch_exit -ne 0 ]]; then
     fn_log_msg "  FAIL $repo_name: fetch failed: $fetch_output"
-    # Check for auth failure -- offer credential rotation
-    if echo "$fetch_output" | grep -qiE "authentication failed|could not read|403|401|invalid credentials|bad credentials"; then
-      fn_rotate_account_credentials "$account" && \
-        fn_log_msg "  INFO $repo_name: credentials updated - re-run to sync"
+    if echo "$fetch_output" | grep -q "403"; then
+      fn_log_msg "  NOTE $repo_name: HTTP 403 - PAT authenticated but repo access denied"
+      fn_log_msg "       Check PAT scopes and repo permissions on GitHub"
+      (( repos_failed++ )) || true
+      return 0
+    elif echo "$fetch_output" | grep -qiE "authentication failed|could not read Password|401|invalid credentials|bad credentials|Invalid username or token"; then
+      if fn_rotate_account_credentials "$account"; then
+        # Rebuild auth URL with new token and retry
+        local new_token="${account_token[$account]:-}"
+        if [[ -n "$new_token" ]]; then
+          local base_url
+          base_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null)
+          # Strip any existing auth prefix (handles both plain and pre-authed URLs)
+          base_url="${base_url#*@}"
+          remote_url="https://oauth2:${new_token}@${base_url}"
+          fetch_output=$(fn_git_net "$repo_path" fetch "$remote_url" --quiet 2>&1) || {
+            fn_log_msg "  FAIL $repo_name: fetch still failing after credential update"
+            (( repos_failed++ )) || true
+            return 0
+          }
+          fn_log_msg "  INFO $repo_name: credentials updated, fetch succeeded - continuing sync"
+          fetch_exit=0
+        fi
+      else
+        (( repos_failed++ )) || true
+        return 0
+      fi
+    else
+      (( repos_failed++ )) || true
+      return 0
     fi
-    (( repos_failed++ )) || true
-    return 0
   fi
 
   # --- Determine sync direction ---
@@ -1407,17 +1691,37 @@ fn_sync_repo() {
     fn_log_msg "  PUSH $repo_name: branch '$current_branch'"
     local push_output push_exit=0
     if [[ -n "$remote_url" ]]; then
-      push_output=$(git -C "$repo_path" push "$remote_url" "${current_branch}" 2>&1) || push_exit=$?
+      push_output=$(fn_git_net "$repo_path" push "$remote_url" "${current_branch}" 2>&1) || push_exit=$?
     elif [[ ${#git_env[@]} -gt 0 ]]; then
-      push_output=$(env "${git_env[@]}" git -C "$repo_path" push origin "${current_branch}" 2>&1) || push_exit=$?
+      push_output=$(fn_git_net "$repo_path" push origin "${current_branch}" 2>&1) || push_exit=$?
     else
-      push_output=$(git -C "$repo_path" push origin "${current_branch}" 2>&1) || push_exit=$?
+      push_output=$(fn_git_net "$repo_path" push origin "${current_branch}" 2>&1) || push_exit=$?
     fi
     if [[ $push_exit -ne 0 ]]; then
       fn_log_msg "  FAIL $repo_name: push failed: $push_output"
-      if echo "$push_output" | grep -qiE "authentication failed|could not read|403|401|invalid credentials|bad credentials"; then
-        fn_rotate_account_credentials "$account" && \
-          fn_log_msg "  INFO $repo_name: credentials updated - re-run to sync"
+      if echo "$push_output" | grep -q "403"; then
+        fn_log_msg "  NOTE $repo_name: HTTP 403 - PAT authenticated but push access denied"
+        fn_log_msg "       Check PAT has 'repo' scope and you have write access to this repo"
+        fn_log_msg "       For fine-grained PATs: needs 'Contents: write' permission"
+      elif echo "$push_output" | grep -qiE "authentication failed|could not read Password|401|invalid credentials|bad credentials|Invalid username or token"; then
+        if fn_rotate_account_credentials "$account"; then
+          local new_token="${account_token[$account]:-}"
+          if [[ -n "$new_token" ]]; then
+            local base_url
+            base_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null)
+            # Strip any existing auth prefix
+            base_url="${base_url#*@}"
+            remote_url="https://oauth2:${new_token}@${base_url}"
+            push_output=$(fn_git_net "$repo_path" push "$remote_url" "${current_branch}" 2>&1) || push_exit=$?
+            if [[ $push_exit -eq 0 ]]; then
+              fn_log_msg "  OK   $repo_name: pushed (after credential update)"
+              (( repos_updated++ )) || true
+              return 0
+            else
+              fn_log_msg "  FAIL $repo_name: push still failing after credential update"
+            fi
+          fi
+        fi
       fi
       (( repos_failed++ )) || true
     else
@@ -1434,11 +1738,11 @@ fn_sync_repo() {
 
   local pull_output pull_exit=0
   if [[ -n "$remote_url" ]]; then
-    pull_output=$(git -C "$repo_path" merge "${pull_flags[@]}" "${tracking}" 2>&1) || pull_exit=$?
+    pull_output=$(fn_git_net "$repo_path" merge "${pull_flags[@]}" "${tracking}" 2>&1) || pull_exit=$?
   elif [[ ${#git_env[@]} -gt 0 ]]; then
-    pull_output=$(env "${git_env[@]}" git -C "$repo_path" merge "${pull_flags[@]}" "${tracking}" 2>&1) || pull_exit=$?
+    pull_output=$(fn_git_net "$repo_path" merge "${pull_flags[@]}" "${tracking}" 2>&1) || pull_exit=$?
   else
-    pull_output=$(git -C "$repo_path" merge "${pull_flags[@]}" "${tracking}" 2>&1) || pull_exit=$?
+    pull_output=$(fn_git_net "$repo_path" merge "${pull_flags[@]}" "${tracking}" 2>&1) || pull_exit=$?
   fi
 
   if [[ $pull_exit -ne 0 ]]; then
@@ -1468,8 +1772,61 @@ fn_sync_repo() {
 
 # Enumerate and sync repos for a single account
 # Layout: $github_root/<repo>/
+# Prompt to clone a repo not found locally when --repo specifies it
+# $1 = repo name
+# $2 = account name
+# $3 = local destination path
+# Returns 0 if cloned successfully, 1 if skipped or failed
+fn_prompt_clone_missing_repo() {
+  local repo_name="$1"
+  local account="$2"
+  local dest="$3"
+
+  if [[ "$dry_run" == "true" ]]; then
+    fn_log_msg "  DRY  $repo_name: not cloned locally - would offer to clone"
+    return 1
+  fi
+
+  if [[ ! -t 0 ]]; then
+    fn_log_msg "  SKIP $repo_name: not found locally and stdin is not a terminal - cannot prompt"
+    return 1
+  fi
+
+  echo ""
+  echo "Repo '$repo_name' is not cloned locally."
+  read -rp "Clone it from GitHub now? [Y/n]: " confirm
+  [[ "$confirm" =~ ^[Nn]$ ]] && { echo "Skipped."; return 1; }
+
+  # Need a PAT to clone
+  local auth_method="${account_auth_method[$account]:-}"
+  local pat="${account_token[$account]:-}"
+
+  if [[ "$auth_method" != "token" || -z "$pat" ]]; then
+    echo "ERROR: Cloning requires a PAT. Account '$account' uses SSH only."
+    echo "       Run: smart-git-sync.sh --update-account --account $account"
+    return 1
+  fi
+
+  fn_log_msg "Cloning $account/$repo_name -> $dest"
+  mkdir -p "$(dirname "$dest")"
+  local clone_out clone_exit=0
+  clone_out=$(GIT_TERMINAL_PROMPT=0 git clone "https://oauth2:${pat}@github.com/$account/$repo_name.git" "$dest" 2>&1) || clone_exit=$?
+  if [[ $clone_exit -ne 0 ]]; then
+    fn_log_msg "  FAIL $repo_name: clone failed: $clone_out"
+    return 1
+  fi
+  fn_log_msg "  OK   $repo_name: cloned"
+  # Clean token from origin URL -- token injected per-operation, not stored in origin
+  git -C "$dest" remote set-url origin "https://github.com/$account/$repo_name.git" 2>/dev/null
+  return 0
+}
+
 fn_process_repos_single_account() {
-  fn_log_msg "Processing repos in: $github_root"
+  if [[ -n "$repo_filter" ]]; then
+    fn_log_msg "Processing repo: $repo_filter (in $github_root)"
+  else
+    fn_log_msg "Processing repos in: $github_root"
+  fi
 
   if [[ ! -d "$github_root" ]]; then
     fn_log_msg "ERROR: github_root does not exist: $github_root"
@@ -1477,10 +1834,24 @@ fn_process_repos_single_account() {
   fi
 
   local account=""
-  # Single-account: pick up the one account name if set
   local account_array
   IFS=', ' read -ra account_array <<< "$accounts"
   [[ ${#account_array[@]} -eq 1 ]] && account="${account_array[0]}"
+
+  # Single repo mode
+  if [[ -n "$repo_filter" ]]; then
+    local repo_path="$github_root/$repo_filter"
+    if [[ ! -d "$repo_path/.git" ]]; then
+      fn_log_msg "Repo '$repo_filter' not found locally at $repo_path"
+      if fn_prompt_clone_missing_repo "$repo_filter" "$account" "$repo_path"; then
+        [[ -d "$repo_path/.git" ]] || return 1
+      else
+        return 0
+      fi
+    fi
+    fn_sync_repo "$account" "$repo_path"
+    return 0
+  fi
 
   local found=0
   for repo_path in "$github_root"/*/; do
@@ -1495,7 +1866,11 @@ fn_process_repos_single_account() {
 # Enumerate and sync repos for multiple accounts
 # Layout: $github_root/<account>/<repo>/
 fn_process_repos_multi_account() {
-  fn_log_msg "Processing repos in: $github_root (multi-account)"
+  if [[ -n "$repo_filter" ]]; then
+    fn_log_msg "Processing repo: $repo_filter (multi-account, in $github_root)"
+  else
+    fn_log_msg "Processing repos in: $github_root (multi-account)"
+  fi
 
   if [[ ! -d "$github_root" ]]; then
     fn_log_msg "ERROR: github_root does not exist: $github_root"
@@ -1511,6 +1886,18 @@ fn_process_repos_multi_account() {
 
     if [[ ! -d "$account_dir" ]]; then
       fn_log_msg "  SKIP: directory not found for account $account"
+      continue
+    fi
+
+    # Single repo mode
+    if [[ -n "$repo_filter" ]]; then
+      local repo_path="$account_dir/$repo_filter"
+      if [[ -d "$repo_path/.git" ]]; then
+        fn_sync_repo "$account" "$repo_path"
+      else
+        fn_log_msg "Repo '$repo_filter' not found locally under $account"
+        fn_prompt_clone_missing_repo "$repo_filter" "$account" "$repo_path"
+      fi
       continue
     fi
 
@@ -1589,6 +1976,10 @@ fn_parse_args() {
         manage_account_action="add"
         shift
         ;;
+      --update-account)
+        manage_account_action="update"
+        shift
+        ;;
       --remove-account)
         manage_account_action="remove"
         shift
@@ -1624,6 +2015,21 @@ fn_parse_args() {
         clone_missing=true
         shift
         ;;
+      --repo)
+        [[ -z "${2:-}" ]] && { echo "ERROR: --repo requires a name"; exit 1; }
+        repo_filter="$2"
+        shift 2
+        ;;
+      --commit)
+        do_commit=true
+        shift
+        ;;
+      --message|-m)
+        [[ -z "${2:-}" ]] && { echo "ERROR: --message requires a value"; exit 1; }
+        commit_message="$2"
+        do_commit=true
+        shift 2
+        ;;
       --version|-V)
         echo "smart-git-sync v${script_version} (${script_released})"
         exit 0
@@ -1651,16 +2057,26 @@ Options:
   (no args)                     Sync all configured repos
   --create-repo <name>          Create a new GitHub repo and clone it locally
   --add-account                 Add a new GitHub account and credentials
+  --update-account              Update credentials for an existing account
   --remove-account              Remove a GitHub account and its credentials
-  --account <name>              Account name (for --create-repo or --remove-account)
+  --account <name>              Account name (for --create-repo, --update-account, or --remove-account)
   --description <text>          Repo description for --create-repo
+  --clone-missing               Clone repos on GitHub not yet present locally (requires PAT)
+  --repo <name>                 Sync a single named repo instead of all repos
+  --commit                      Stage and commit dirty changes before syncing
+  --message, -m <text>          Commit message (implies --commit; prompts if omitted)
   --dry-run                     Show what would happen, make no changes
   --status                      Show current configuration and repo counts
-  --list-repos                  List repos that would be synced, no git operations
-  --clone-missing               Clone repos on GitHub not yet present locally (requires PAT)
+  --list-repos                  Show full two-way repo overview (local vs GitHub)
   --reset                       Remove config and credential files (accounts must be removed first)
   --version, -V                 Print version and exit
   --help                        Show this message
+
+Chainable flags (run in order, left to right):
+  --update-account --list-repos     Update credentials then show repo overview
+  --clone-missing --list-repos      Clone missing repos then show updated overview
+  --add-account --list-repos        Add account then verify with repo overview
+  --repo <name> --dry-run           Preview sync for a single repo
 USAGE
 }
 
@@ -1743,15 +2159,17 @@ fn_clone_missing_for_account() {
       continue
     fi
 
-    local clone_url="https://${pat}@github.com/$account/$repo_name.git"
+    local clone_url="https://oauth2:${pat}@github.com/$account/$repo_name.git"
     local clone_out clone_exit=0
-    clone_out=$(git clone "$clone_url" "$repo_path" 2>&1) || clone_exit=$?
+    clone_out=$(GIT_TERMINAL_PROMPT=0 git clone "$clone_url" "$repo_path" 2>&1) || clone_exit=$?
 
     if [[ $clone_exit -ne 0 ]]; then
       fn_log_msg "  FAIL $repo_name: $clone_out"
       (( failed++ )) || true
     else
       fn_log_msg "  OK   $repo_name: cloned"
+      # Clean token from origin -- token injected per-operation, not stored in origin
+      git -C "$repo_path" remote set-url origin "https://github.com/$account/$repo_name.git" 2>/dev/null
       (( cloned++ )) || true
     fi
   done
@@ -1868,91 +2286,150 @@ fn_reset_config() {
 
 # List repos that would be synced -- pure filesystem scan, no git operations
 # Single-account: $github_root/*/  Multi-account: $github_root/<account>/*/
+# List repos for a single account -- called by fn_list_repos
+# $1 = account name
+# $2 = local directory to scan
+fn_list_repos_for_account() {
+  local account="$1"
+  local local_dir="$2"
+  local auth_method="${account_auth_method[$account]:-}"
+  local pat="${account_token[$account]:-}"
+  local can_query_api=false
+
+  [[ "$auth_method" == "token" && -n "$pat" ]] && can_query_api=true
+
+  # --- Get local repos ---
+  declare -A local_repos=()
+  if [[ -d "$local_dir" ]]; then
+    for repo_path in "$local_dir"/*/; do
+      [[ -d "$repo_path/.git" ]] || continue
+      local repo_name
+      repo_name="$(basename "$repo_path")"
+      local branch="(unknown)"
+      local head_file="$repo_path/.git/HEAD"
+      if [[ -f "$head_file" ]]; then
+        local head_content
+        head_content=$(cat "$head_file")
+        if [[ "$head_content" =~ ref:\ refs/heads/(.+) ]]; then
+          branch="${BASH_REMATCH[1]}"
+        else
+          branch="(detached HEAD)"
+        fi
+      fi
+      local_repos["$repo_name"]="$branch"
+    done
+  fi
+
+  # --- Get remote repos via API ---
+  declare -A remote_repos=()
+  if [[ "$can_query_api" == "true" ]]; then
+    local page=1
+    local api_ok=false
+    while true; do
+      local response http_code body
+      response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer $pat" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/user/repos?per_page=100&page=${page}&affiliation=owner") || break
+      http_code=$(echo "$response" | tail -n1)
+      body=$(echo "$response" | head -n -1)
+      if [[ "$http_code" != "200" ]]; then
+        local api_msg
+        api_msg=$(echo "$body" | grep -o '"message":"[^"]*"' | cut -d'"' -f4)
+        echo "  WARNING: GitHub API returned HTTP $http_code: ${api_msg:-unknown}"
+        echo "           Credentials may be invalid. Run: smart-git-sync.sh --update-account --account $account"
+        break
+      fi
+      api_ok=true
+      local page_names=()
+      while IFS= read -r name; do
+        [[ -n "$name" ]] && page_names+=( "$name" )
+      done < <(echo "$body" | grep -E '^    "name":' | cut -d'"' -f4)
+      [[ ${#page_names[@]} -eq 0 ]] && break
+      for name in "${page_names[@]}"; do
+        remote_repos["$name"]=1
+      done
+      [[ ${#page_names[@]} -lt 100 ]] && break
+      (( page++ )) || true
+    done
+    [[ "$api_ok" == "false" && ${#remote_repos[@]} -eq 0 ]] && can_query_api=false
+  fi
+
+  # --- Print header ---
+  if [[ "$mode" == "multi-account" ]]; then
+    echo "  Account: $account"
+  fi
+
+  if [[ "$can_query_api" == "false" ]]; then
+    echo "  NOTE: SSH-only account -- cannot query GitHub API"
+    echo "        To see the full picture, add a PAT for this account:"
+    echo "          smart-git-sync.sh --update-account --account $account"
+    echo ""
+  fi
+
+  # --- Cross-reference and print ---
+  local local_count=0 remote_only_count=0 both_count=0
+
+  for repo_name in $(echo "${!local_repos[@]}" | tr ' ' '\n' | sort); do
+    local branch="${local_repos[$repo_name]}"
+    if [[ "$can_query_api" == "true" ]]; then
+      if [[ -n "${remote_repos[$repo_name]:-}" ]]; then
+        printf "  %-40s  [%s]  <-> GitHub\n" "$repo_name" "$branch"
+        (( both_count++ )) || true
+      else
+        printf "  %-40s  [%s]  LOCAL ONLY (not on GitHub)\n" "$repo_name" "$branch"
+      fi
+    else
+      printf "  %-40s  [%s]\n" "$repo_name" "$branch"
+    fi
+    (( local_count++ )) || true
+  done
+
+  if [[ "$can_query_api" == "true" ]]; then
+    for repo_name in $(echo "${!remote_repos[@]}" | tr ' ' '\n' | sort); do
+      if [[ -z "${local_repos[$repo_name]:-}" ]]; then
+        printf "  %-40s  (on GitHub, not cloned locally)\n" "$repo_name"
+        (( remote_only_count++ )) || true
+      fi
+    done
+  fi
+
+  echo ""
+
+  if [[ "$can_query_api" == "true" ]]; then
+    local total_github=$(( both_count + remote_only_count ))
+    echo "  Summary: $local_count local  |  $total_github on GitHub  |  $remote_only_count not cloned"
+    if [[ $remote_only_count -gt 0 ]]; then
+      echo "  Run --clone-missing to clone the $remote_only_count missing repo(s)"
+    fi
+  else
+    echo "  Summary: $local_count local (GitHub total unknown -- SSH only)"
+  fi
+  echo ""
+}
+
 fn_list_repos() {
   local account_array
   IFS=', ' read -ra account_array <<< "$accounts"
-  local total=0
 
-  echo ""
-  echo "Repos that would be synced:"
-  echo ""
-
-  if [[ "$mode" == "single-account" ]]; then
-    local account="${account_array[0]:-}"
-    if [[ ! -d "$github_root" ]]; then
-      echo "  ERROR: github_root not found: $github_root"
-      return 1
-    fi
-    for repo_path in "$github_root"/*/; do
-      [[ -d "$repo_path" ]] || continue
-      local repo_name
-      repo_name="$(basename "$repo_path")"
-      if [[ -d "$repo_path/.git" ]]; then
-        # Show current branch if we can get it cheaply (just reads .git/HEAD, no network)
-        local branch=""
-        local head_file="$repo_path/.git/HEAD"
-        if [[ -f "$head_file" ]]; then
-          local head_content
-          head_content=$(cat "$head_file")
-          if [[ "$head_content" =~ ref:\ refs/heads/(.+) ]]; then
-            branch="${BASH_REMATCH[1]}"
-          else
-            branch="(detached HEAD)"
-          fi
-        fi
-        printf "  %-40s  [%s]\n" "$repo_name" "$branch"
-        (( total++ )) || true
-      else
-        printf "  %-40s  (not a git repo - would be skipped)\n" "$repo_name"
-      fi
-    done
-
-  elif [[ "$mode" == "multi-account" ]]; then
-    for account in "${account_array[@]}"; do
-      local account_dir="$github_root/$account"
-      echo "  $account/"
-      if [[ ! -d "$account_dir" ]]; then
-        echo "    (directory not found - account would be skipped)"
-        continue
-      fi
-      local found=false
-      for repo_path in "$account_dir"/*/; do
-        [[ -d "$repo_path" ]] || continue
-        local repo_name
-        repo_name="$(basename "$repo_path")"
-        if [[ -d "$repo_path/.git" ]]; then
-          local branch=""
-          local head_file="$repo_path/.git/HEAD"
-          if [[ -f "$head_file" ]]; then
-            local head_content
-            head_content=$(cat "$head_file")
-            if [[ "$head_content" =~ ref:\ refs/heads/(.+) ]]; then
-              branch="${BASH_REMATCH[1]}"
-            else
-              branch="(detached HEAD)"
-            fi
-          fi
-          printf "    %-38s  [%s]\n" "$repo_name" "$branch"
-          (( total++ )) || true
-          found=true
-        else
-          printf "    %-38s  (not a git repo - would be skipped)\n" "$repo_name"
-          found=true
-        fi
-      done
-      [[ "$found" == "false" ]] && echo "    (no subdirectories found)"
-      echo ""
-    done
-
-  else
+  if [[ "$mode" == "first-run" || ${#account_array[@]} -eq 0 ]]; then
     echo "  No accounts configured."
     return 0
   fi
 
   echo ""
-  echo "Total: $total repo(s) would be synced"
+  echo "Repository overview:"
   echo ""
+
+  if [[ "$mode" == "single-account" ]]; then
+    fn_list_repos_for_account "${account_array[0]}" "$github_root"
+  elif [[ "$mode" == "multi-account" ]]; then
+    for account in "${account_array[@]}"; do
+      fn_list_repos_for_account "$account" "$github_root/$account"
+    done
+  fi
 }
+
 
 fn_print_status() {
   echo ""
@@ -2145,6 +2622,87 @@ fn_remove_account() {
   echo "Account '$target' removed."
 }
 
+# Update credentials for an existing account -- no remove/re-add needed
+# $1 = account name (optional -- prompted if not supplied and multi-account)
+fn_update_account() {
+  local target="$1"
+
+  local account_array
+  IFS=', ' read -ra account_array <<< "$accounts"
+
+  if [[ ${#account_array[@]} -eq 0 ]]; then
+    echo "No accounts configured. Use --add-account to add one."
+    return 1
+  fi
+
+  # If no name supplied and only one account, use it
+  if [[ -z "$target" && ${#account_array[@]} -eq 1 ]]; then
+    target="${account_array[0]}"
+  fi
+
+  # If no name supplied and multiple accounts, prompt
+  if [[ -z "$target" ]]; then
+    echo ""
+    echo "=== Update Account Credentials ==="
+    echo "Configured accounts:"
+    local i=1
+    for a in "${account_array[@]}"; do
+      local method="${account_auth_method[$a]:-unknown}"
+      echo "  $i) $a  ($method)"
+      (( i++ )) || true
+    done
+    echo ""
+    local choice
+    read -rp "Account number or name to update: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#account_array[@]} )); then
+      target="${account_array[$((choice-1))]}"
+    else
+      target="$choice"
+    fi
+  fi
+
+  # Validate account exists
+  local found=false
+  for a in "${account_array[@]}"; do
+    [[ "$a" == "$target" ]] && found=true && break
+  done
+  if [[ "$found" == "false" ]]; then
+    echo "ERROR: Account '$target' not found. Use --add-account to add a new one."
+    return 1
+  fi
+
+  echo ""
+  echo "Updating credentials for: $target"
+  local current_method="${account_auth_method[$target]:-unknown}"
+  echo "Current auth method: $current_method"
+  echo ""
+
+  # Clear existing credential for this account
+  unset "account_auth_method[$target]"
+  unset "account_token[$target]"
+  unset "account_ssh_key[$target]"
+
+  # Prompt and validate new credential
+  if fn_prompt_and_validate_credential "$target"; then
+    local updated_account="$CREDENTIAL_ACCOUNT"
+    fn_log_msg "Credentials updated for '$updated_account'"
+
+    if [[ -n "$password_store" ]]; then
+      fn_save_credentials
+    else
+      echo ""
+      echo "NOTE: No credential store configured -- credentials not persisted."
+      echo "      Set password_store to save credentials between runs."
+    fi
+
+    echo ""
+    echo "Done. Credentials updated for '$updated_account'."
+  else
+    echo "Update cancelled."
+    return 1
+  fi
+}
+
 ### Repo creation ###
 
 # Create a new repo on GitHub via REST API, then clone it locally
@@ -2300,14 +2858,14 @@ fn_create_repo() {
 
   # --- Clone ---
   # Embed PAT in URL -- works for both classic and fine-grained PATs
-  local clone_url="https://${pat}@github.com/$account/$repo_name.git"
+  local clone_url="https://oauth2:${pat}@github.com/$account/$repo_name.git"
   fn_log_msg "Cloning $account/$repo_name -> $clone_dest"
 
   mkdir -p "$(dirname "$clone_dest")"
 
   local clone_output
   local clone_exit=0
-  clone_output=$(git clone "$clone_url" "$clone_dest" 2>&1) || clone_exit=$?
+  clone_output=$(GIT_TERMINAL_PROMPT=0 git clone "$clone_url" "$clone_dest" 2>&1) || clone_exit=$?
 
   if [[ $clone_exit -ne 0 ]]; then
     echo "ERROR: Clone failed: $clone_output"
@@ -2316,6 +2874,8 @@ fn_create_repo() {
   fi
 
   fn_log_msg "Cloned to: $clone_dest"
+  # Clean token from origin -- token injected per-operation, not stored in origin
+  git -C "$clone_dest" remote set-url origin "https://github.com/$account/$repo_name.git" 2>/dev/null
   echo ""
   echo "Done. $account/$repo_name created and cloned to $clone_dest"
 }
@@ -2330,10 +2890,19 @@ fn_init_logging
 
 [[ "$dry_run" == "true" ]] && fn_log_msg "=== DRY RUN - no changes will be made ==="
 
-# Load external config if specified
+# Load external config if specified, or check default location
+if [[ -z "$cfg_path" ]]; then
+  local_default_cfg="$HOME/.config/smart-git-sync/config.cfg"
+  if [[ -f "$local_default_cfg" ]]; then
+    cfg_path="$local_default_cfg"
+    use_external_cfg=true
+    fn_log_msg "Auto-detected config: $cfg_path"
+  fi
+fi
+
 if [[ -n "$cfg_path" ]]; then
   use_external_cfg=true
-  cfg_path=$(fn_normalize_path "$cfg_path" "smart-git-sync.cfg")
+  cfg_path=$(fn_normalize_path "$cfg_path" "")
   fn_log_msg "Using external config: $cfg_path"
   fn_load_external_config
 fi
@@ -2341,16 +2910,35 @@ fi
 # Detect mode (loads credentials for each account)
 fn_detect_mode
 
-# --clone-missing: fetch GitHub repo list and clone anything not local
-if [[ "$clone_missing" == "true" ]]; then
-  fn_clone_missing
-  exit $?
-fi
-
-# --reset: must run after config load but before anything that touches credentials
+# --reset: must run after config load, before anything else -- always terminal
 if [[ "$reset_config" == "true" ]]; then
   fn_reset_config
   exit $?
+fi
+
+# --create-repo: always terminal (interactive confirmation flow)
+if [[ -n "$create_repo_name" ]]; then
+  fn_create_repo "$create_repo_name" "$create_repo_account" "$create_repo_description"
+  exit $?
+fi
+
+# Account management: runs first, then falls through to allow chaining
+# e.g. --update-account --list-repos updates credentials then shows the overview
+if [[ "$manage_account_action" == "add" ]]; then
+  fn_add_account || exit $?
+fi
+
+if [[ "$manage_account_action" == "update" ]]; then
+  fn_update_account "$manage_account_name" || exit $?
+fi
+
+if [[ "$manage_account_action" == "remove" ]]; then
+  fn_remove_account "$manage_account_name" || exit $?
+fi
+
+# --clone-missing: runs and falls through to allow chaining with --list-repos
+if [[ "$clone_missing" == "true" ]]; then
+  fn_clone_missing || exit $?
 fi
 
 # --status: show config and exit
@@ -2359,27 +2947,10 @@ if [[ "$show_status" == "true" ]]; then
   exit 0
 fi
 
-# --list-repos: filesystem scan only, no git operations
+# --list-repos: show two-way overview and exit
 if [[ "$list_repos" == "true" ]]; then
   fn_list_repos
   exit 0
-fi
-
-# --add-account / --remove-account: branch off, skip normal sync
-if [[ "$manage_account_action" == "add" ]]; then
-  fn_add_account
-  exit $?
-fi
-
-if [[ "$manage_account_action" == "remove" ]]; then
-  fn_remove_account "$manage_account_name"
-  exit $?
-fi
-
-# --create-repo: branch off, skip normal sync
-if [[ -n "$create_repo_name" ]]; then
-  fn_create_repo "$create_repo_name" "$create_repo_account" "$create_repo_description"
-  exit $?
 fi
 
 # Normal sync
@@ -2389,7 +2960,12 @@ elif [[ "$mode" == "multi-account" ]]; then
   fn_process_repos_multi_account
 elif [[ "$mode" == "first-run" ]]; then
   fn_first_run_setup
-  exit 0
+  # Setup complete -- mode is now set by the wizard, proceed to sync
+  if [[ "$mode" == "single-account" ]]; then
+    fn_process_repos_single_account
+  elif [[ "$mode" == "multi-account" ]]; then
+    fn_process_repos_multi_account
+  fi
 fi
 
 # Print summary
